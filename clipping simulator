@@ -1,0 +1,739 @@
+# Clipping Simulator
+Hafif anlik tekrar (instant replay) ekran kaydedici. Kayit RAM'de degil diskte kisa parcalar halinde tutulur,
+eski parcalar silinir. "Klip al" son N saniyeyi mp4 yapar.
+Hata olursa: %APPDATA%\ClippingSimulator\ffmpeg.log dosyasina bak.
+
+PyAudioWPatch
+
+# -*- coding: utf-8 -*-
+"""Clipping Simulator - hafif anlik tekrar (instant replay) ekran kaydedici.
+
+Mantik:
+  * ffmpeg ekrani (+ sistem sesini) kisa 2 saniyelik parcalar halinde DISKE yazar.
+  * Eski parcalar surekli silinir -> RAM'e hicbir sey birikmez, sonsuz buyume olmaz.
+  * "Klip al" deyince son N saniyenin parcalari birlestirilip tek mp4 olur.
+"""
+import ctypes
+import json
+import math
+import os
+import queue
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import tkinter as tk
+from datetime import datetime
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+
+try:
+    import winsound
+except ImportError:  # Windows disi
+    winsound = None
+
+APP = "ClippingSimulator"
+SEG = 2  # parca suresi (saniye)
+IS_WIN = sys.platform == "win32"
+NO_WINDOW = 0x08000000 if IS_WIN else 0  # ffmpeg icin konsol penceresi acma
+
+CFG_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / APP
+CFG_FILE = CFG_DIR / "settings.json"
+LOG_FILE = CFG_DIR / "ffmpeg.log"
+
+# cozunurluk: (yukseklik, 30fps icin kbps)
+RES = {
+    "720p": (720, 4000),
+    "1080p": (1080, 8000),
+    "1440p": (1440, 14000),
+    "Orijinal": (0, 18000),
+}
+HOTKEYS = {"F6": 0x75, "F7": 0x76, "F8": 0x77, "F9": 0x78, "F10": 0x79, "F11": 0x7A, "F12": 0x7B}
+
+DEFAULTS = {
+    "buffer": 120,
+    "res": "1080p",
+    "fps": 60,
+    "audio": True,
+    "hotkey": "F9",
+    "beep": True,
+    "outdir": str(Path.home() / "Videos" / APP),
+}
+
+# (isim, ffmpeg encoder argumanlari) - en hizlidan en yavasa; sonuncusu her bilgisayarda calisir
+ENCODERS = [
+    ("NVIDIA NVENC", ["-c:v", "h264_nvenc", "-preset", "p3"]),
+    ("AMD AMF", ["-c:v", "h264_amf", "-quality", "speed"]),
+    ("Intel QSV", ["-c:v", "h264_qsv", "-preset", "veryfast"]),
+    ("CPU (x264)", ["-c:v", "libx264", "-preset", "superfast", "-sc_threshold", "0"]),
+]
+
+
+# --------------------------------------------------------------------------- yardimcilar
+def base_dir():
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    return Path(__file__).resolve().parent
+
+
+def find_ffmpeg():
+    for p in (
+        base_dir() / "ffmpeg.exe",
+        base_dir() / "bin" / "ffmpeg.exe",
+        Path(sys.executable).parent / "ffmpeg.exe",
+    ):
+        if p.exists():
+            return str(p)
+    return shutil.which("ffmpeg")
+
+
+def run(cmd, timeout=30):
+    return subprocess.run(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=NO_WINDOW,
+        timeout=timeout,
+    )
+
+
+def load_cfg():
+    cfg = dict(DEFAULTS)
+    try:
+        cfg.update(json.loads(CFG_FILE.read_text(encoding="utf-8")))
+    except Exception:
+        pass
+    return cfg
+
+
+def save_cfg(cfg):
+    try:
+        CFG_DIR.mkdir(parents=True, exist_ok=True)
+        CFG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def native_height():
+    try:
+        return int(ctypes.windll.user32.GetSystemMetrics(1))
+    except Exception:
+        return 0
+
+
+def capture_args(method, fps):
+    """Ekran yakalama girdisi. Ikisi de sari 'yakaliyor' cercevesi CIZMEZ."""
+    if method == "ddagrab":  # DXGI Desktop Duplication (GPU, hizli)
+        return (
+            ["-f", "lavfi", "-i", f"ddagrab=output_idx=0:framerate={fps}:draw_mouse=1"],
+            "hwdownload,format=bgra",
+        )
+    return (  # GDI yedek yontem
+        ["-f", "gdigrab", "-framerate", str(fps), "-draw_mouse", "1", "-i", "desktop"],
+        "",
+    )
+
+
+def vf_chain(pre, target_h, native_h, pixfmt):
+    parts = []
+    if pre:
+        parts.append(pre)
+    if target_h and native_h and target_h < native_h:
+        parts.append(f"scale=-2:{target_h}:flags=fast_bilinear")
+    else:
+        parts.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")  # cift boyut sart
+    parts.append(f"format={pixfmt}")
+    return ",".join(parts)
+
+
+def pixfmt_for(enc_name):
+    return "yuv420p" if enc_name.startswith("CPU") else "nv12"
+
+
+def detect_pipeline(ffmpeg):
+    """Bu bilgisayarda calisan en iyi (yakalama yontemi, encoder) ikilisini bulur."""
+    native = native_height()
+
+    def works(method, enc):
+        cap, pre = capture_args(method, 30)
+        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"] + cap
+        cmd += ["-vf", vf_chain(pre, 720, native, pixfmt_for(enc[0]))]
+        cmd += ["-frames:v", "10"] + enc[1] + ["-b:v", "4000k", "-f", "null", "-"]
+        try:
+            return run(cmd, 25).returncode == 0
+        except Exception:
+            return False
+
+    cpu = ENCODERS[-1]
+    method = next((m for m in ("ddagrab", "gdigrab") if works(m, cpu)), None)
+    if method is None:
+        return None
+    for enc in ENCODERS[:-1]:
+        if works(method, enc):
+            return method, enc
+    return method, cpu
+
+
+# --------------------------------------------------------------------------- kisayol
+class Hotkey(threading.Thread):
+    """Oyun icindeyken de calisan global kisayol (RegisterHotKey)."""
+
+    def __init__(self, vk, callback):
+        super().__init__(daemon=True)
+        self.vk = vk
+        self.callback = callback
+        self.tid = None
+        self.ok = threading.Event()
+        self.failed = False
+
+    def run(self):
+        try:
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            self.tid = ctypes.windll.kernel32.GetCurrentThreadId()
+            if not user32.RegisterHotKey(None, 1, 0x4000, self.vk):  # MOD_NOREPEAT
+                self.failed = True
+                self.ok.set()
+                return
+            self.ok.set()
+            msg = wintypes.MSG()
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+                if msg.message == 0x0312:  # WM_HOTKEY
+                    self.callback()
+            user32.UnregisterHotKey(None, 1)
+        except Exception:
+            self.failed = True
+            self.ok.set()
+
+    def stop(self):
+        try:
+            if self.tid:
+                ctypes.windll.user32.PostThreadMessageW(self.tid, 0x0012, 0, 0)  # WM_QUIT
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------- kayit motoru
+class Recorder:
+    def __init__(self, ffmpeg, pipeline, cfg, events):
+        self.ffmpeg = ffmpeg
+        self.pipeline = pipeline
+        self.cfg = dict(cfg)
+        self.events = events
+        self.segdir = Path(tempfile.gettempdir()) / APP / "buffer"
+        self.proc = None
+        self.pa = None
+        self.stream = None
+        self.audio_q = queue.Queue()
+        self.stop_evt = threading.Event()
+        self.saving = False
+        self.log = None
+        self.audio_on = False
+
+    # ---- baslat
+    def start(self):
+        shutil.rmtree(self.segdir, ignore_errors=True)
+        self.segdir.mkdir(parents=True, exist_ok=True)
+        CFG_DIR.mkdir(parents=True, exist_ok=True)
+
+        method, (enc_name, enc_args) = self.pipeline
+        fps = int(self.cfg["fps"])
+        target_h, base_kbps = RES[self.cfg["res"]]
+        kbps = int(base_kbps * (1.4 if fps >= 60 else 1.0))
+        cap, pre = capture_args(method, fps)
+
+        rate = ch = 0
+        if self.cfg["audio"]:
+            try:
+                rate, ch = self._open_audio()
+                self.audio_on = True
+            except Exception as e:
+                self.audio_on = False
+                self.events.put(("note", f"Ses acilamadi, sessiz kaydediliyor ({e})"))
+
+        cmd = [self.ffmpeg, "-hide_banner", "-loglevel", "warning", "-y"]
+        if not self.audio_on:
+            cmd.append("-nostdin")
+        cmd += cap
+        if self.audio_on:
+            cmd += ["-thread_queue_size", "1024", "-f", "s16le", "-ar", str(rate), "-ac", str(ch), "-i", "pipe:0"]
+        cmd += ["-map", "0:v"]
+        if self.audio_on:
+            cmd += ["-map", "1:a"]
+        cmd += ["-vf", vf_chain(pre, target_h, native_height(), pixfmt_for(enc_name))]
+        cmd += ["-fps_mode", "cfr", "-r", str(fps)]
+        cmd += enc_args
+        cmd += [
+            "-b:v", f"{kbps}k",
+            "-maxrate", f"{int(kbps * 1.3)}k",
+            "-bufsize", f"{kbps * 2}k",
+            "-g", str(fps * SEG),
+            "-force_key_frames", f"expr:gte(t,n_forced*{SEG})",
+        ]
+        if self.audio_on:
+            cmd += ["-c:a", "aac", "-b:a", "160k", "-ac", "2", "-af", "aresample=async=1"]
+        cmd += [
+            "-f", "segment",
+            "-segment_time", str(SEG),
+            "-segment_format", "mpegts",
+            "-reset_timestamps", "1",
+            "-flush_packets", "1",
+            str(self.segdir / "seg_%06d.ts"),
+        ]
+
+        self.log = open(LOG_FILE, "wb")
+        self.log.write((" ".join(cmd) + "\n\n").encode("utf-8", "ignore"))
+        self.log.flush()
+        self.proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE if self.audio_on else subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=self.log,
+            creationflags=NO_WINDOW,
+        )
+
+        if self.audio_on:
+            self.stream.start_stream()
+            threading.Thread(target=self._feed_audio, args=(rate, ch), daemon=True).start()
+        threading.Thread(target=self._cleanup_loop, daemon=True).start()
+        threading.Thread(target=self._watch, daemon=True).start()
+
+    # ---- ses (WASAPI loopback = tum sistem sesi)
+    def _open_audio(self):
+        import pyaudiowpatch as pyaudio
+
+        self.pa = pyaudio.PyAudio()
+        dev = self.pa.get_default_wasapi_loopback()
+        rate = int(dev["defaultSampleRate"])
+        ch = int(dev["maxInputChannels"])
+
+        def cb(in_data, frame_count, time_info, status):
+            self.audio_q.put(in_data)
+            return (None, pyaudio.paContinue)
+
+        self.stream = self.pa.open(
+            format=pyaudio.paInt16,
+            channels=ch,
+            rate=rate,
+            input=True,
+            input_device_index=dev["index"],
+            frames_per_buffer=1024,
+            stream_callback=cb,
+            start=False,
+        )
+        return rate, ch
+
+    def _feed_audio(self, rate, ch):
+        """Loopback sessizken veri uretmez; ffmpeg'in zaman cizgisi bozulmasin diye
+        eksik kismi sessizlikle doldururuz."""
+        bpf = 2 * ch
+        pad_min = rate // 4
+        t0 = time.perf_counter()
+        written = 0
+        while not self.stop_evt.is_set():
+            time.sleep(0.02)
+            chunks = []
+            while True:
+                try:
+                    chunks.append(self.audio_q.get_nowait())
+                except queue.Empty:
+                    break
+            data = b"".join(chunks)
+            frames = len(data) // bpf
+            target = int((time.perf_counter() - t0) * rate)
+            missing = target - written - frames
+            if missing > pad_min:
+                data = bytes(missing * bpf) + data
+            if data:
+                try:
+                    self.proc.stdin.write(data)
+                    self.proc.stdin.flush()
+                except Exception:
+                    break
+                written += len(data) // bpf
+
+    # ---- eski parcalari sil (RAM yok, disk de sinirli kalir)
+    def _cleanup_loop(self):
+        keep = math.ceil(self.cfg["buffer"] / SEG) + 3
+        while not self.stop_evt.wait(1.0):
+            if self.saving:
+                continue
+            segs = sorted(self.segdir.glob("seg_*.ts"))
+            for f in segs[:-keep]:
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+
+    def _watch(self):
+        while not self.stop_evt.wait(1.0):
+            if self.proc and self.proc.poll() is not None:
+                self.events.put(("crash", f"ffmpeg beklenmedik sekilde durdu.\nKayit: {LOG_FILE}"))
+                return
+
+    # ---- klip al
+    def save_clip(self):
+        outdir = Path(self.cfg["outdir"])
+        outdir.mkdir(parents=True, exist_ok=True)
+        self.saving = True
+        try:
+            segs = sorted(self.segdir.glob("seg_*.ts"))
+            n = math.ceil(self.cfg["buffer"] / SEG) + 1
+            segs = [s for s in segs[-n:] if s.stat().st_size > 0]
+            if not segs:
+                raise RuntimeError("Henuz kayitli parca yok, birkac saniye bekle.")
+            out = outdir / f"Klip_{datetime.now():%Y-%m-%d_%H-%M-%S}.mp4"
+            err = ""
+            for use in (segs, segs[:-1]):  # olmazsa yazilmakta olan son parcayi dene-cikar
+                if not use:
+                    break
+                lst = self.segdir / "concat.txt"
+                lst.write_text(
+                    "".join("file '" + s.as_posix().replace("'", "'\\''") + "'\n" for s in use),
+                    encoding="utf-8",
+                )
+                cmd = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                       "-f", "concat", "-safe", "0", "-i", str(lst),
+                       "-c", "copy", "-movflags", "+faststart", str(out)]
+                r = run(cmd, 180)
+                if r.returncode == 0 and out.exists() and out.stat().st_size > 0:
+                    return out
+                err = r.stderr.decode("utf-8", "ignore")[-400:]
+            raise RuntimeError("Klip olusturulamadi:\n" + err)
+        finally:
+            self.saving = False
+
+    # ---- durdur
+    def stop(self):
+        self.stop_evt.set()
+        if self.proc:
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=5)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+        try:
+            if self.stream:
+                self.stream.stop_stream()
+                self.stream.close()
+        except Exception:
+            pass
+        try:
+            if self.pa:
+                self.pa.terminate()
+        except Exception:
+            pass
+        try:
+            if self.log:
+                self.log.close()
+        except Exception:
+            pass
+        self.proc = self.stream = self.pa = None
+        time.sleep(0.2)
+        shutil.rmtree(self.segdir, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- arayuz
+BG, CARD, FG, MUTED = "#14161a", "#1d2026", "#e8e8ea", "#8b8f98"
+RED, GREEN, BLUE = "#e5484d", "#30a46c", "#3e63dd"
+
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.cfg = load_cfg()
+        self.events = queue.Queue()
+        self.rec = None
+        self.hotkey = None
+        self.t0 = 0.0
+        self.pipeline = None
+        self.clip_busy = False
+        self.ffmpeg = find_ffmpeg()
+        self.locked_widgets = []
+
+        root.title("Clipping Simulator")
+        root.configure(bg=BG)
+        root.resizable(False, False)
+        self.build_ui()
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        if not self.ffmpeg:
+            self.set_status("ffmpeg bulunamadi!", RED)
+        else:
+            self.set_status("Donanim algilaniyor...", MUTED)
+            threading.Thread(target=self._detect, daemon=True).start()
+        self.poll()
+
+    # -- arayuz kurulumu
+    def build_ui(self):
+        st = ttk.Style()
+        try:
+            st.theme_use("clam")
+        except tk.TclError:
+            pass
+        st.configure("TCombobox", fieldbackground=CARD, background=CARD, foreground=FG,
+                     arrowcolor=FG, bordercolor=CARD, lightcolor=CARD, darkcolor=CARD)
+        st.map("TCombobox", fieldbackground=[("readonly", CARD)], foreground=[("readonly", FG)],
+               selectbackground=[("readonly", CARD)], selectforeground=[("readonly", FG)])
+        st.configure("TSpinbox", fieldbackground=CARD, background=CARD, foreground=FG,
+                     arrowcolor=FG, bordercolor=CARD, lightcolor=CARD, darkcolor=CARD)
+        self.root.option_add("*TCombobox*Listbox.background", CARD)
+        self.root.option_add("*TCombobox*Listbox.foreground", FG)
+
+        wrap = tk.Frame(self.root, bg=BG, padx=20, pady=16)
+        wrap.pack(fill="both", expand=True)
+
+        tk.Label(wrap, text="Clipping Simulator", bg=BG, fg=FG,
+                 font=("Segoe UI", 18, "bold")).pack(anchor="w")
+        self.status = tk.Label(wrap, text="", bg=BG, fg=MUTED, font=("Segoe UI", 10),
+                               anchor="w", justify="left", wraplength=400)
+        self.status.pack(fill="x", pady=(2, 12))
+
+        self.rec_btn = self.big_button(wrap, "Kaydi Baslat", GREEN, self.toggle_record)
+        self.rec_btn.pack(fill="x", pady=(0, 8))
+        self.clip_btn = self.big_button(wrap, "Klip Al", BLUE, self.take_clip)
+        self.clip_btn.pack(fill="x")
+        self.clip_btn.config(state="disabled")
+        self.hint = tk.Label(wrap, text="", bg=BG, fg=MUTED, font=("Segoe UI", 9))
+        self.hint.pack(pady=(4, 12))
+
+        card = tk.Frame(wrap, bg=CARD, padx=14, pady=12)
+        card.pack(fill="x")
+
+        self.v_buffer = tk.IntVar(value=int(self.cfg["buffer"]))
+        self.v_res = tk.StringVar(value=self.cfg["res"])
+        self.v_fps = tk.StringVar(value=str(self.cfg["fps"]))
+        self.v_audio = tk.BooleanVar(value=bool(self.cfg["audio"]))
+        self.v_hotkey = tk.StringVar(value=self.cfg["hotkey"])
+        self.v_beep = tk.BooleanVar(value=bool(self.cfg["beep"]))
+
+        self.row(card, 0, "Buffer suresi (sn)",
+                 ttk.Spinbox(card, from_=10, to=900, increment=10, width=8, textvariable=self.v_buffer))
+        self.row(card, 1, "Cozunurluk",
+                 ttk.Combobox(card, values=list(RES), textvariable=self.v_res, state="readonly", width=10))
+        self.row(card, 2, "FPS",
+                 ttk.Combobox(card, values=["30", "60"], textvariable=self.v_fps, state="readonly", width=10))
+        self.row(card, 3, "Klip kisayolu",
+                 ttk.Combobox(card, values=list(HOTKEYS), textvariable=self.v_hotkey, state="readonly", width=10))
+        self.row(card, 4, "Sistem sesi",
+                 self.check(card, "Kaydet", self.v_audio))
+        self.row(card, 5, "Klip bildirimi",
+                 self.check(card, "Klip alinca bip sesi", self.v_beep))
+
+        self.dir_lbl = tk.Label(card, text="", bg=CARD, fg=MUTED, font=("Segoe UI", 9), anchor="w")
+        self.dir_lbl.grid(row=6, column=0, columnspan=2, sticky="we", pady=(10, 0))
+        self.refresh_dir_label()
+        btns = tk.Frame(card, bg=CARD)
+        btns.grid(row=7, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        b1 = self.small_button(btns, "Klasor sec", self.choose_dir)
+        b1.pack(side="left")
+        b2 = self.small_button(btns, "Klasoru ac", self.open_dir)
+        b2.pack(side="left", padx=(6, 0))
+        self.locked_widgets.append(b1)
+        card.columnconfigure(1, weight=1)
+
+    def row(self, parent, r, label, widget):
+        tk.Label(parent, text=label, bg=CARD, fg=FG, font=("Segoe UI", 10)).grid(
+            row=r, column=0, sticky="w", pady=4)
+        widget.grid(row=r, column=1, sticky="e", pady=4)
+        self.locked_widgets.append(widget)
+
+    def check(self, parent, text, var):
+        return tk.Checkbutton(parent, text=text, variable=var, bg=CARD, fg=FG,
+                              selectcolor=BG, activebackground=CARD, activeforeground=FG,
+                              font=("Segoe UI", 10), bd=0, highlightthickness=0)
+
+    def big_button(self, parent, text, color, cmd):
+        return tk.Button(parent, text=text, command=cmd, bg=color, fg="white",
+                         activebackground=color, activeforeground="white", relief="flat",
+                         bd=0, font=("Segoe UI", 13, "bold"), pady=10, cursor="hand2",
+                         disabledforeground="#cfd2d8")
+
+    def small_button(self, parent, text, cmd):
+        return tk.Button(parent, text=text, command=cmd, bg=BG, fg=FG, activebackground=BG,
+                         activeforeground=FG, relief="flat", bd=0, font=("Segoe UI", 9),
+                         padx=10, pady=4, cursor="hand2")
+
+    # -- yardimci arayuz
+    def set_status(self, text, color=MUTED):
+        self.status.config(text=text, fg=color)
+
+    def refresh_dir_label(self):
+        d = self.cfg["outdir"]
+        self.dir_lbl.config(text="Klipler: " + (d if len(d) < 48 else "..." + d[-45:]))
+
+    def choose_dir(self):
+        d = filedialog.askdirectory(initialdir=self.cfg["outdir"])
+        if d:
+            self.cfg["outdir"] = d
+            save_cfg(self.cfg)
+            self.refresh_dir_label()
+
+    def open_dir(self):
+        Path(self.cfg["outdir"]).mkdir(parents=True, exist_ok=True)
+        try:
+            os.startfile(self.cfg["outdir"])
+        except Exception:
+            pass
+
+    def lock_settings(self, locked):
+        for w in self.locked_widgets:
+            try:
+                if isinstance(w, ttk.Combobox):
+                    w.config(state="disabled" if locked else "readonly")
+                else:
+                    w.config(state="disabled" if locked else "normal")
+            except tk.TclError:
+                pass
+
+    # -- algilama
+    def _detect(self):
+        try:
+            self.pipeline = detect_pipeline(self.ffmpeg)
+        except Exception:
+            self.pipeline = None
+        self.events.put(("detected", None))
+
+    # -- kayit baslat / durdur
+    def collect_cfg(self):
+        try:
+            buf = int(self.v_buffer.get())
+        except (tk.TclError, ValueError):
+            buf = DEFAULTS["buffer"]
+        self.cfg["buffer"] = max(10, min(900, buf))
+        self.v_buffer.set(self.cfg["buffer"])
+        self.cfg["res"] = self.v_res.get()
+        self.cfg["fps"] = int(self.v_fps.get())
+        self.cfg["audio"] = bool(self.v_audio.get())
+        self.cfg["hotkey"] = self.v_hotkey.get()
+        self.cfg["beep"] = bool(self.v_beep.get())
+        save_cfg(self.cfg)
+
+    def toggle_record(self):
+        if self.rec:
+            self.stop_record()
+        else:
+            self.start_record()
+
+    def start_record(self):
+        if not self.pipeline:
+            messagebox.showerror("Hata", "Ekran yakalama baslatilamadi (ffmpeg testi basarisiz).")
+            return
+        self.collect_cfg()
+        self.rec = Recorder(self.ffmpeg, self.pipeline, self.cfg, self.events)
+        try:
+            self.rec.start()
+        except Exception as e:
+            self.rec = None
+            messagebox.showerror("Hata", f"Kayit baslatilamadi:\n{e}")
+            return
+        self.hotkey = Hotkey(HOTKEYS[self.cfg["hotkey"]], lambda: self.events.put(("clip", None)))
+        self.hotkey.start()
+        self.hotkey.ok.wait(1.0)
+        hk_note = ""
+        if self.hotkey.failed:
+            hk_note = f"  ({self.cfg['hotkey']} kisayolu baska program tarafindan kullaniliyor)"
+        self.t0 = time.time()
+        self.rec_btn.config(text="Kaydi Durdur", bg=RED, activebackground=RED)
+        self.clip_btn.config(state="normal")
+        self.hint.config(text=f"Kisayol: {self.cfg['hotkey']}{hk_note}")
+        self.lock_settings(True)
+
+    def stop_record(self):
+        if self.hotkey:
+            self.hotkey.stop()
+            self.hotkey = None
+        rec, self.rec = self.rec, None
+        if rec:
+            rec.stop()
+        self.rec_btn.config(text="Kaydi Baslat", bg=GREEN, activebackground=GREEN)
+        self.clip_btn.config(state="disabled")
+        self.hint.config(text="")
+        self.lock_settings(False)
+        self.set_status("Kayit durduruldu. Buffer temizlendi.", MUTED)
+
+    # -- klip al
+    def take_clip(self):
+        if not self.rec or self.clip_busy:
+            return
+        self.clip_busy = True
+        self.set_status("Klip kaydediliyor...", BLUE)
+        rec = self.rec
+
+        def work():
+            try:
+                path = rec.save_clip()
+                self.events.put(("saved", str(path)))
+            except Exception as e:
+                self.events.put(("clip_error", str(e)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # -- olay dongusu (diger thread'lerden gelen mesajlar)
+    def poll(self):
+        try:
+            while True:
+                kind, val = self.events.get_nowait()
+                if kind == "detected":
+                    if self.pipeline:
+                        self.set_status(f"Hazir  |  {self.pipeline[1][0]}  |  {self.pipeline[0]}", MUTED)
+                    else:
+                        self.set_status("Ekran yakalama bu bilgisayarda calismadi.", RED)
+                elif kind == "clip":
+                    self.take_clip()
+                elif kind == "saved":
+                    self.clip_busy = False
+                    self.set_status("Klip kaydedildi: " + Path(val).name, GREEN)
+                    if self.cfg["beep"] and winsound:
+                        try:
+                            winsound.Beep(880, 150)
+                        except Exception:
+                            pass
+                elif kind == "clip_error":
+                    self.clip_busy = False
+                    self.set_status(val, RED)
+                elif kind == "note":
+                    messagebox.showinfo("Bilgi", val)
+                elif kind == "crash":
+                    if self.rec:
+                        self.stop_record()
+                    self.set_status(val, RED)
+        except queue.Empty:
+            pass
+        if self.rec and not self.clip_busy:
+            s = int(time.time() - self.t0)
+            self.set_status(
+                f"KAYIT  {s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}  |  "
+                f"Son {self.cfg['buffer']} sn tutuluyor  |  {self.pipeline[1][0]}",
+                RED,
+            )
+        self.root.after(250, self.poll)
+
+    def on_close(self):
+        try:
+            if self.rec:
+                self.stop_record()
+            self.collect_cfg()
+        finally:
+            self.root.destroy()
+
+
+def main():
+    try:  # net goruntu icin DPI farkindaligi
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+    root = tk.Tk()
+    App(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
